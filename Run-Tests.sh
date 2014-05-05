@@ -1,4 +1,4 @@
-#!/bin/bash -ex
+#!/bin/bash -e
 
 OSX_SDK="macosx"
 if [ -z "$TRAVIS" ]; then
@@ -19,8 +19,49 @@ ARC_PRODUCT="$ARC_BUILD_DIR/$CONFIGURATION/GCDWebServer"
 PAYLOAD_ZIP="Tests/Payload.zip"
 PAYLOAD_DIR="/tmp/GCDWebServer"
 
+TRACE_SCRIPT="/tmp/trace.d"
+TRACE_OUTPUT="/tmp/trace.txt"
+DTRACE_SCRIPT='
+
+#!/usr/bin/env dtrace -s
+#pragma D option quiet
+
+pid$target:libobjc.A.dylib:class_createInstance:entry
+{
+  ptr0 = arg0;
+  ptr1 = *(long*)copyin(ptr0, 8);
+  ptr2 = *(long*)copyin((ptr1 + 32) & ~3, 8);
+  flags = *(int*)copyin(ptr2, 4);
+  ptr3 = (flags & (1 << 31)) || (flags & (1 << 30)) ? *(long*)copyin(ptr2 + 8, 8) : ptr2;
+  ptr4 = *(long*)copyin(ptr3 + 24, 8);
+  class = copyinstr(ptr4);
+  
+  @allocations[class] = sum(1);
+}
+
+/* Do not use objc_destructInstance() which is used to recycle objects */
+pid$target:libobjc.A.dylib:object_dispose:entry
+/arg0 != 0/
+{
+  ptr0 = *(long*)copyin(arg0, 8);  /* TODO: Getting ISA from object this way will not work for tagged pointers but they likely do not get disposed of anyway */
+  ptr1 = *(long*)copyin(ptr0, 8);
+  ptr2 = *(long*)copyin((ptr1 + 32) & ~3, 8);
+  ptr3 = (flags & (1 << 31)) || (flags & (1 << 30)) ? *(long*)copyin(ptr2 + 8, 8) : ptr2;
+  ptr4 = *(long*)copyin(ptr3 + 24, 8);
+  class = copyinstr(ptr4);
+  
+  @allocations[class] = sum(-1);
+}
+
+END
+{
+  printa(@allocations);
+}
+
+'
+
 function runTests {
-  rm -rf "$PAYLOAD_DIR"
+  sudo rm -rf "$PAYLOAD_DIR"
   ditto -x -k "$PAYLOAD_ZIP" "$PAYLOAD_DIR"
   TZ=GMT find "$PAYLOAD_DIR" -type d -exec SetFile -d "1/1/2014 00:00:00" -m "1/1/2014 00:00:00" '{}' \;  # ZIP archives do not preserve directories dates
   if [ "$4" != "" ]; then
@@ -29,7 +70,34 @@ function runTests {
     SetFile -d "1/1/2014 00:00:00" -m "1/1/2014 00:00:00" `basename "$4"`
     popd
   fi
-  logLevel=2 $1 -mode "$2" -root "$PAYLOAD_DIR/Payload" -tests "$3"
+  
+  sudo rm -f "$TRACE_OUTPUT"
+  sudo DYLD_SHARED_REGION=avoid logLevel=2 dtrace -s "$TRACE_SCRIPT" -o "$TRACE_OUTPUT" -c "$1 -mode $2 -root $PAYLOAD_DIR/Payload -tests $3"
+  
+  echo "=============== LIVE OBJ-C OBJECTS ==============="
+  OLD_IFS="$IFS"
+  IFS=$'\n'
+  SUCCESS=1
+  for LINE in `sort -b "$TRACE_OUTPUT"`; do
+    CLASS=`echo -n "$LINE" | awk '{ print $1 }'`
+    COUNT=`echo -n "$LINE" | awk '{ print $2 }'`
+    if [[ "$CLASS" != OS_* && "$CLASS" != _NS*  && "$CLASS" != __NS* && "$CLASS" != __CF* ]]; then
+      if [ $COUNT -gt 0 ]; then
+        printf "%40s %7s\n" "$CLASS" "$COUNT"
+        if [[ "$CLASS" == GCDWebServer* ]]; then
+          SUCCESS=0
+        fi
+      fi
+    fi
+  done
+  IFS="$OLD_IFS"
+  echo "=================================================="
+  if [ $SUCCESS -eq 0 ]; then
+    echo "[FAILURE] GCDWebServer objects are leaking!"
+    exit 1
+  fi
+  
+  # logLevel=2 $1 -mode "$2" -root "$PAYLOAD_DIR/Payload" -tests "$3"
 }
 
 # Build for iOS in manual memory management mode (TODO: run tests on iOS)
@@ -47,6 +115,10 @@ xcodebuild -sdk "$OSX_SDK" -target "$OSX_TARGET" -configuration "$CONFIGURATION"
 # Build for OS X in ARC mode
 rm -rf "$ARC_BUILD_DIR"
 xcodebuild -sdk "$OSX_SDK" -target "$OSX_TARGET" -configuration "$CONFIGURATION" build "SYMROOT=$ARC_BUILD_DIR" "CLANG_ENABLE_OBJC_ARC=YES" > /dev/null
+
+# Prepare tests
+rm -f "$TRACE_SCRIPT"
+echo "$DTRACE_SCRIPT" > "$TRACE_SCRIPT"
 
 # Run tests
 runTests $MRC_PRODUCT "htmlForm" "Tests/HTMLForm"
