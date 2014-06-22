@@ -697,7 +697,7 @@ static inline NSString* _EncodeBase64(NSString* string) {
 }
 
 - (BOOL)runWithOptions:(NSDictionary*)options error:(NSError**)error {
-  DCHECK([NSThread isMainThread]);
+  // DCHECK([NSThread isMainThread]); we can use multiple threads
   BOOL success = NO;
   _run = YES;
   void (*termHandler)(int) = signal(SIGTERM, _SignalHandler);
